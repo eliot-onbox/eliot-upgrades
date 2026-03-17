@@ -1,0 +1,733 @@
+#!/usr/bin/env python3
+"""
+eliot-ctx — CLI for querying Eliot's context database.
+
+Usage:
+  eliot-ctx last [N]              Show last N events (default 10)
+  eliot-ctx location              Last known location
+  eliot-ctx state                 Full Tudor state (location, battery, focus)
+  eliot-ctx spending [--summary]  Spending breakdown
+  eliot-ctx spending --top N      Top N expenses
+  eliot-ctx spending --category X Show transactions in category
+  eliot-ctx spending --daily      Daily spending averages
+  eliot-ctx balance               Current balance and burn rate
+  eliot-ctx import [csv_path]     Import Revolut CSV
+  eliot-ctx brief                 Compact context line for heartbeat
+  eliot-ctx digest [--stdout]     Gather today's data, append to daily note
+  eliot-ctx todo                  List pending tasks from TASKQUEUE.md
+  eliot-ctx todo add "task"       Add task (--from tudor|self)
+  eliot-ctx todo done N           Mark task N as done
+  eliot-ctx todo clean            Remove completed tasks
+  eliot-ctx forecast [--income N] 30-day balance projection
+  eliot-ctx bridge [N]            Last N bridge conversations (default all today)
+  eliot-ctx bridge --stats        Message counts and frequency
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timedelta
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from db import get_conn, init_db, DB_PATH
+from categories import CATEGORY_LABELS
+
+STATE_FILE = "/home/eliot/workspace/data/tudor-state.json"
+MEMORY_DIR = os.path.expanduser("~/.openclaw/workspace/memory")
+TASKQUEUE_PATH = os.path.expanduser("~/.openclaw/workspace/TASKQUEUE.md")
+PROJECTS_DIR = os.path.expanduser("~/projects")
+BRIDGE_LOG = os.path.expanduser("~/projects/agent-bridge/conversations.log")
+
+
+def cmd_last(n: int = 10):
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT timestamp, event_type, payload, source FROM events ORDER BY id DESC LIMIT ?",
+        (n,),
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        print("No events recorded yet.")
+        return
+
+    for r in rows:
+        payload = json.loads(r["payload"])
+        payload_short = json.dumps(payload) if len(json.dumps(payload)) < 80 else json.dumps(payload)[:77] + "..."
+        print(f"  {r['timestamp']}  [{r['event_type']:>10s}]  {r['source']:>7s}  {payload_short}")
+
+
+def cmd_location():
+    if not os.path.exists(STATE_FILE):
+        print("No state file yet. Waiting for first iPhone event.")
+        return
+
+    with open(STATE_FILE) as f:
+        state = json.load(f)
+
+    loc = state.get("location")
+    if not loc:
+        print("No location data yet.")
+        return
+
+    print(f"  Location: {loc['name']}")
+    print(f"  Event:    {loc['event']}")
+    print(f"  Updated:  {loc['updated_at']}")
+
+
+def cmd_state():
+    if not os.path.exists(STATE_FILE):
+        print("No state file yet. Waiting for first iPhone event.")
+        return
+
+    with open(STATE_FILE) as f:
+        state = json.load(f)
+
+    print(json.dumps(state, indent=2))
+
+
+def cmd_spending_summary():
+    from spending import spending_summary
+
+    for currency, product in [("EUR", "Current"), ("PHP", "Savings")]:
+        summary = spending_summary(currency, product)
+        if not summary["by_category"]:
+            continue
+
+        p = summary["period"]
+        print(f"\n{'='*60}")
+        print(f"  {currency} {product} Account  ({p['from'][:10]} to {p['to'][:10]})")
+        print(f"{'='*60}")
+
+        if summary["income"] > 0:
+            print(f"  Income:   +{summary['income']:>10.2f} {currency}")
+        print(f"  Spending:  {summary['spending']:>10.2f} {currency}")
+        if summary["income"] > 0:
+            print(f"  Net:       {summary['net']:>10.2f} {currency}")
+        if summary["current_balance"] is not None:
+            print(f"  Balance:   {summary['current_balance']:>10.2f} {currency}")
+
+        print()
+        for cat in summary["by_category"]:
+            label = CATEGORY_LABELS.get(cat["category"], cat["category"])
+            print(f"    {label:<25s} {cat['total']:>10.2f} {currency}  ({cat['count']}x)")
+
+
+def cmd_spending_top(n: int = 10):
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT description, amount, currency, completed_date, category
+           FROM transactions
+           WHERE amount < 0 AND state = 'COMPLETED'
+           AND category NOT IN ('savings_transfer', 'currency_exchange')
+           ORDER BY amount ASC LIMIT ?""",
+        (n,),
+    ).fetchall()
+    conn.close()
+
+    print(f"\n  Top {n} largest expenses:")
+    for r in rows:
+        label = CATEGORY_LABELS.get(r["category"], r["category"])
+        date = r["completed_date"][:10] if r["completed_date"] else "pending"
+        print(f"    {date}  {r['amount']:>10.2f} {r['currency']}  {r['description']:<35s}  [{label}]")
+
+
+def cmd_spending_category(cat: str):
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT description, amount, currency, completed_date
+           FROM transactions
+           WHERE category = ? AND state = 'COMPLETED'
+           ORDER BY completed_date DESC""",
+        (cat,),
+    ).fetchall()
+    total = conn.execute(
+        "SELECT SUM(amount) FROM transactions WHERE category = ? AND state = 'COMPLETED'",
+        (cat,),
+    ).fetchone()[0]
+    conn.close()
+
+    label = CATEGORY_LABELS.get(cat, cat)
+    print(f"\n  {label} — {len(rows)} transactions, total: {total:.2f}")
+    for r in rows:
+        date = r["completed_date"][:10] if r["completed_date"] else "pending"
+        print(f"    {date}  {r['amount']:>10.2f} {r['currency']}  {r['description']}")
+
+
+def cmd_spending_daily():
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT DATE(completed_date) as day, SUM(amount) as total, COUNT(*) as count
+           FROM transactions
+           WHERE currency = 'EUR' AND product = 'Current'
+           AND amount < 0 AND state = 'COMPLETED'
+           AND category NOT IN ('savings_transfer', 'currency_exchange')
+           AND completed_date IS NOT NULL
+           GROUP BY day ORDER BY day""",
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        print("No spending data.")
+        return
+
+    total_spent = sum(r["total"] for r in rows)
+    num_days = len(rows)
+    avg = total_spent / num_days if num_days else 0
+
+    print(f"\n  Daily EUR spending ({num_days} days):")
+    print(f"  Average: {avg:.2f} EUR/day")
+    print()
+    for r in rows:
+        bar = "#" * min(50, int(abs(r["total"]) / 5))
+        print(f"    {r['day']}  {r['total']:>8.2f} EUR  ({r['count']:>2d} txns)  {bar}")
+
+
+def cmd_balance():
+    from spending import spending_summary
+
+    summary = spending_summary("EUR", "Current")
+    balance = summary["current_balance"]
+    if balance is None:
+        print("No balance data.")
+        return
+
+    # Calculate daily burn rate from last 14 days
+    conn = get_conn()
+    rows = conn.execute(
+        """SELECT SUM(amount) as total, COUNT(DISTINCT DATE(completed_date)) as days
+           FROM transactions
+           WHERE currency = 'EUR' AND product = 'Current'
+           AND amount < 0 AND state = 'COMPLETED'
+           AND category NOT IN ('savings_transfer', 'currency_exchange', 'loan_payment', 'remittance')
+           AND completed_date >= date('now', '-14 days')""",
+    ).fetchone()
+    conn.close()
+
+    daily_burn = abs(rows["total"] / rows["days"]) if rows["days"] and rows["total"] else 0
+
+    print(f"\n  Current balance: {balance:.2f} EUR")
+    if daily_burn > 0:
+        days_left = balance / daily_burn
+        zero_date = datetime.now() + timedelta(days=days_left)
+        print(f"  Daily burn rate: {daily_burn:.2f} EUR/day (last 14 days, excl. loans/remittances)")
+        print(f"  Days until zero: {days_left:.0f} days ({zero_date.strftime('%B %d')})")
+    else:
+        print("  Not enough recent data for burn rate.")
+
+
+def cmd_brief():
+    """One compact context block for heartbeat consumption."""
+    lines = []
+
+    # Tudor state from webhooks
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE) as f:
+            state = json.load(f)
+
+        loc = state.get("location")
+        if loc:
+            ago = _time_ago(loc["updated_at"])
+            lines.append(f"Tudor {loc['event']} {loc['name']} ({ago})")
+
+        bat = state.get("battery")
+        if bat:
+            charging = ", charging" if bat.get("charging") else ""
+            lines.append(f"Battery: {bat['level']}%{charging}")
+
+        focus = state.get("focus")
+        if focus and focus.get("active"):
+            lines.append(f"Focus: {focus['mode']}")
+
+    # Financial snapshot
+    conn = get_conn()
+    last_balance = conn.execute(
+        """SELECT balance FROM transactions
+           WHERE currency = 'EUR' AND product = 'Current'
+           AND balance IS NOT NULL AND state = 'COMPLETED'
+           ORDER BY completed_date DESC LIMIT 1""",
+    ).fetchone()
+
+    if last_balance:
+        balance = last_balance["balance"]
+        burn_row = conn.execute(
+            """SELECT SUM(amount) as total, COUNT(DISTINCT DATE(completed_date)) as days
+               FROM transactions
+               WHERE currency = 'EUR' AND product = 'Current'
+               AND amount < 0 AND state = 'COMPLETED'
+               AND category NOT IN ('savings_transfer', 'currency_exchange', 'loan_payment', 'remittance')
+               AND completed_date >= date('now', '-14 days')""",
+        ).fetchone()
+
+        if burn_row["days"] and burn_row["total"]:
+            daily_burn = abs(burn_row["total"] / burn_row["days"])
+            days_left = balance / daily_burn if daily_burn > 0 else 999
+            zero_date = datetime.now() + timedelta(days=days_left)
+            lines.append(f"Balance: EUR{balance:.0f} (~{days_left:.0f}d at EUR{daily_burn:.0f}/day, zero {zero_date.strftime('%b %d')})")
+        else:
+            lines.append(f"Balance: EUR{balance:.0f}")
+
+    conn.close()
+
+    # Recent events count
+    conn = get_conn()
+    recent = conn.execute(
+        "SELECT COUNT(*) FROM events WHERE created_at >= datetime('now', '-24 hours')"
+    ).fetchone()[0]
+    conn.close()
+    if recent > 0:
+        lines.append(f"Events (24h): {recent}")
+
+    if lines:
+        print("CONTEXT: " + " | ".join(lines))
+    else:
+        print("CONTEXT: No data yet. Webhook system running, awaiting first iPhone events.")
+
+
+def _time_ago(iso_str: str) -> str:
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        delta = datetime.now() - dt
+        minutes = int(delta.total_seconds() / 60)
+        if minutes < 1:
+            return "just now"
+        if minutes < 60:
+            return f"{minutes}m ago"
+        hours = minutes // 60
+        if hours < 24:
+            return f"{hours}h ago"
+        return f"{hours // 24}d ago"
+    except (ValueError, TypeError):
+        return "unknown"
+
+
+def cmd_digest(stdout_only: bool = False):
+    """Gather today's data from all sources. Append to daily note or print."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    sections = []
+
+    # 1. Git commits across all projects
+    git_lines = []
+    if os.path.isdir(PROJECTS_DIR):
+        for name in sorted(os.listdir(PROJECTS_DIR)):
+            repo = os.path.join(PROJECTS_DIR, name)
+            git_dir = os.path.join(repo, ".git")
+            if not os.path.exists(git_dir):
+                continue
+            try:
+                result = subprocess.run(
+                    ["git", "-C", repo, "log", "--oneline", "--since=midnight", "--format=%h %s"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.stdout.strip():
+                    for line in result.stdout.strip().split("\n"):
+                        git_lines.append(f"  {name}: {line}")
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                pass
+
+    if git_lines:
+        sections.append("### Git Activity\n" + "\n".join(git_lines))
+
+    # 2. Files created/modified today in workspace
+    file_changes = []
+    workspace = os.path.expanduser("~/.openclaw/workspace")
+    for dirpath, _dirs, filenames in os.walk(workspace):
+        # Skip deep nested dirs
+        depth = dirpath.replace(workspace, "").count(os.sep)
+        if depth > 2:
+            continue
+        for f in filenames:
+            fp = os.path.join(dirpath, f)
+            try:
+                mtime = datetime.fromtimestamp(os.path.getmtime(fp))
+                if mtime.strftime("%Y-%m-%d") == today:
+                    rel = fp.replace(workspace + "/", "")
+                    file_changes.append(f"  {rel} (modified {mtime.strftime('%H:%M')})")
+            except OSError:
+                pass
+
+    if file_changes:
+        sections.append("### Workspace Files Modified\n" + "\n".join(file_changes[:20]))
+
+    # 3. Webhook events today
+    conn = get_conn()
+    event_summary = conn.execute(
+        """SELECT event_type, COUNT(*) as c
+           FROM events WHERE DATE(created_at) = ?
+           GROUP BY event_type ORDER BY c DESC""",
+        (today,),
+    ).fetchall()
+    conn.close()
+
+    if event_summary:
+        ev_lines = [f"  {r['event_type']}: {r['c']}" for r in event_summary]
+        sections.append("### Webhook Events\n" + "\n".join(ev_lines))
+
+    # 4. Agent bridge conversations today
+    bridge_lines = []
+    if os.path.exists(BRIDGE_LOG):
+        with open(BRIDGE_LOG) as f:
+            for line in f:
+                if f"[{today}" in line:
+                    # Strip to just direction + preview
+                    m = re.match(r'\[.*?\] (IN|OUT) \(.*?\): (.+)', line.strip())
+                    if m:
+                        direction = "Ela->" if m.group(1) == "IN" else "->Ela"
+                        msg = m.group(2)[:100]
+                        bridge_lines.append(f"  {direction}: {msg}")
+
+    if bridge_lines:
+        sections.append("### Agent Bridge\n" + "\n".join(bridge_lines))
+
+    # 5. Financial snapshot
+    conn = get_conn()
+    last_bal = conn.execute(
+        """SELECT balance FROM transactions
+           WHERE currency='EUR' AND product='Current' AND balance IS NOT NULL
+           AND state='COMPLETED' ORDER BY completed_date DESC LIMIT 1""",
+    ).fetchone()
+    tx_today = conn.execute(
+        "SELECT COUNT(*) FROM transactions WHERE DATE(completed_date) = ?", (today,)
+    ).fetchone()[0]
+    conn.close()
+
+    if last_bal:
+        sections.append(f"### Finance\n  Balance: EUR {last_bal['balance']:.2f}\n  Transactions today: {tx_today}")
+
+    # 6. System services
+    svc_lines = []
+    try:
+        result = subprocess.run(
+            ["systemctl", "list-units", "--type=service", "--state=running", "--no-pager", "--plain"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.split("\n"):
+            if "eliot" in line.lower() or "agent" in line.lower() or "openclaw" in line.lower():
+                svc_lines.append(f"  {line.strip().split()[0]}")
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+    if svc_lines:
+        sections.append("### Running Services\n" + "\n".join(svc_lines))
+
+    # Assemble output
+    if not sections:
+        print("No activity found for today.")
+        return
+
+    digest_text = f"\n## Auto-Digest ({datetime.now().strftime('%H:%M')})\n\n" + "\n\n".join(sections) + "\n"
+
+    if stdout_only:
+        print(digest_text)
+        return
+
+    # Append to daily note
+    note_path = os.path.join(MEMORY_DIR, f"{today}.md")
+    if os.path.exists(note_path):
+        with open(note_path, "a") as f:
+            f.write(digest_text)
+        print(f"Appended digest to {note_path}")
+    else:
+        with open(note_path, "w") as f:
+            f.write(f"# {today}\n{digest_text}")
+        print(f"Created {note_path} with digest")
+
+
+# --- TASKQUEUE management ---
+
+def _parse_taskqueue():
+    """Parse TASKQUEUE.md into a list of (done, text) tuples."""
+    tasks = []
+    if not os.path.exists(TASKQUEUE_PATH):
+        return tasks
+    with open(TASKQUEUE_PATH) as f:
+        for line in f:
+            m = re.match(r'^- \[([ xX])\] (.+)$', line.strip())
+            if m:
+                done = m.group(1).lower() == 'x'
+                tasks.append({"done": done, "text": m.group(2)})
+    return tasks
+
+
+def _write_taskqueue(tasks, header=None):
+    """Write tasks back to TASKQUEUE.md, preserving header."""
+    if header is None:
+        header = (
+            "# TASKQUEUE.md -- Deferred Tasks\n"
+            "# Tasks queued here when usage is too low to execute.\n"
+            "# Heartbeat checks usage + picks these up when limits reset.\n"
+            "# Format: - [ ] TASK DESCRIPTION (queued: DATE, from: Tudor/self)\n"
+        )
+    else:
+        # Read existing header lines (comments at the top)
+        pass
+
+    # Preserve original header from file
+    lines = []
+    if os.path.exists(TASKQUEUE_PATH):
+        with open(TASKQUEUE_PATH) as f:
+            for line in f:
+                if line.startswith("#") or line.strip() == "":
+                    lines.append(line)
+                else:
+                    break
+
+    if not lines:
+        lines = [
+            "# TASKQUEUE.md -- Deferred Tasks\n",
+            "# Format: - [ ] TASK (queued: DATE, from: source)\n",
+            "\n",
+        ]
+
+    with open(TASKQUEUE_PATH, "w") as f:
+        f.writelines(lines)
+        for t in tasks:
+            mark = "x" if t["done"] else " "
+            f.write(f"- [{mark}] {t['text']}\n")
+
+
+def cmd_todo_list():
+    tasks = _parse_taskqueue()
+    if not tasks:
+        print("No tasks in TASKQUEUE.md")
+        return
+
+    pending = [t for t in tasks if not t["done"]]
+    done = [t for t in tasks if t["done"]]
+
+    if pending:
+        print(f"  Pending ({len(pending)}):")
+        for i, t in enumerate(tasks):
+            if not t["done"]:
+                print(f"    {i+1}. [ ] {t['text']}")
+
+    if done:
+        print(f"  Done ({len(done)}):")
+        for i, t in enumerate(tasks):
+            if t["done"]:
+                print(f"    {i+1}. [x] {t['text']}")
+
+
+def cmd_todo_add(description: str, source: str = "self"):
+    tasks = _parse_taskqueue()
+    today = datetime.now().strftime("%Y-%m-%d")
+    entry = f"{description} (queued: {today}, from: {source})"
+    tasks.append({"done": False, "text": entry})
+    _write_taskqueue(tasks)
+    print(f"  Added: {entry}")
+
+
+def cmd_todo_done(task_num: int):
+    tasks = _parse_taskqueue()
+    if task_num < 1 or task_num > len(tasks):
+        print(f"  Invalid task number {task_num}. Range: 1-{len(tasks)}")
+        return
+
+    t = tasks[task_num - 1]
+    if t["done"]:
+        print(f"  Already done: {t['text']}")
+        return
+
+    t["done"] = True
+    _write_taskqueue(tasks)
+    print(f"  Done: {t['text']}")
+
+
+def cmd_todo_clean():
+    tasks = _parse_taskqueue()
+    before = len(tasks)
+    tasks = [t for t in tasks if not t["done"]]
+    after = len(tasks)
+    _write_taskqueue(tasks)
+    print(f"  Removed {before - after} completed tasks. {after} remaining.")
+
+
+def cmd_forecast(args: list):
+    from forecast import forecast, print_forecast
+
+    income = None
+    balance = None
+    for i, a in enumerate(args):
+        if a == "--income" and i + 1 < len(args):
+            income = float(args[i + 1])
+        elif a == "--balance" and i + 1 < len(args):
+            balance = float(args[i + 1])
+
+    result = forecast(balance=balance, expected_income=income)
+    print_forecast(result)
+
+
+def cmd_bridge(args: list):
+    """Parse and display agent bridge conversations."""
+    if not os.path.exists(BRIDGE_LOG):
+        print("No bridge conversation log found.")
+        return
+
+    if "--stats" in args:
+        _bridge_stats()
+        return
+
+    # Show conversations, default: today only
+    show_all = "--all" in args
+    n_limit = None
+    for i, a in enumerate(args):
+        if a.isdigit():
+            n_limit = int(a)
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    messages = []
+
+    with open(BRIDGE_LOG) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            m = re.match(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] (IN|OUT) \(([^)]+)\): (.+)', line)
+            if m:
+                ts, direction, host, msg = m.groups()
+                date_part = ts[:10]
+                if not show_all and date_part != today:
+                    continue
+                messages.append({
+                    "timestamp": ts,
+                    "direction": "recv" if direction == "IN" else "sent",
+                    "host": host,
+                    "message": msg,
+                })
+
+    if not messages:
+        print(f"  No bridge messages {'today' if not show_all else 'found'}.")
+        return
+
+    if n_limit:
+        messages = messages[-n_limit:]
+
+    for msg in messages:
+        arrow = "<<" if msg["direction"] == "recv" else ">>"
+        label = "Ela" if msg["direction"] == "recv" else "Me"
+        # Truncate long messages for display
+        text = msg["message"]
+        if len(text) > 120:
+            text = text[:117] + "..."
+        print(f"  {msg['timestamp']}  {arrow} {label}: {text}")
+
+
+def _bridge_stats():
+    """Show bridge message statistics."""
+    if not os.path.exists(BRIDGE_LOG):
+        print("No bridge log.")
+        return
+
+    sent = 0
+    recv = 0
+    days = set()
+
+    with open(BRIDGE_LOG) as f:
+        for line in f:
+            m = re.match(r'\[(\d{4}-\d{2}-\d{2}) \d{2}:\d{2}:\d{2}\] (IN|OUT)', line)
+            if m:
+                days.add(m.group(1))
+                if m.group(2) == "OUT":
+                    sent += 1
+                else:
+                    recv += 1
+
+    total = sent + recv
+    num_days = len(days)
+    avg = total / num_days if num_days else 0
+
+    print(f"\n  Bridge Statistics:")
+    print(f"    Total messages: {total} ({sent} sent, {recv} received)")
+    print(f"    Active days: {num_days}")
+    print(f"    Average: {avg:.1f} messages/day")
+    if days:
+        print(f"    First: {min(days)}")
+        print(f"    Last:  {max(days)}")
+
+
+def cmd_import(csv_path: str = None):
+    from spending import parse_and_load, DEFAULT_CSV
+
+    path = csv_path or DEFAULT_CSV
+    result = parse_and_load(path)
+    print(f"Loaded {result['rows_inserted']} transactions from {os.path.basename(result['file'])}")
+
+
+def main():
+    init_db()
+    args = sys.argv[1:]
+
+    if not args:
+        print(__doc__)
+        return
+
+    cmd = args[0]
+
+    if cmd == "last":
+        n = int(args[1]) if len(args) > 1 else 10
+        cmd_last(n)
+    elif cmd == "location":
+        cmd_location()
+    elif cmd == "state":
+        cmd_state()
+    elif cmd == "spending":
+        if "--summary" in args or len(args) == 1:
+            cmd_spending_summary()
+        elif "--top" in args:
+            idx = args.index("--top")
+            n = int(args[idx + 1]) if idx + 1 < len(args) else 10
+            cmd_spending_top(n)
+        elif "--category" in args:
+            idx = args.index("--category")
+            if idx + 1 < len(args):
+                cmd_spending_category(args[idx + 1])
+            else:
+                print("Usage: eliot-ctx spending --category <category_name>")
+                print(f"Categories: {', '.join(CATEGORY_LABELS.keys())}")
+        elif "--daily" in args:
+            cmd_spending_daily()
+        else:
+            cmd_spending_summary()
+    elif cmd == "balance":
+        cmd_balance()
+    elif cmd == "brief":
+        cmd_brief()
+    elif cmd == "digest":
+        cmd_digest(stdout_only="--stdout" in args)
+    elif cmd == "todo":
+        if len(args) < 2 or args[1] == "list":
+            cmd_todo_list()
+        elif args[1] == "add" and len(args) >= 3:
+            desc = " ".join(args[2:]).strip()
+            # Extract --from if present
+            source = "self"
+            if "--from" in args:
+                fi = args.index("--from")
+                if fi + 1 < len(args):
+                    source = args[fi + 1]
+                    # Remove --from and its value from description
+                    desc = " ".join(a for i, a in enumerate(args[2:], 2)
+                                    if i != fi and i != fi + 1).strip()
+            cmd_todo_add(desc, source)
+        elif args[1] == "done" and len(args) >= 3:
+            cmd_todo_done(int(args[2]))
+        elif args[1] == "clean":
+            cmd_todo_clean()
+        else:
+            print("Usage: eliot-ctx todo [list|add|done|clean]")
+    elif cmd == "forecast":
+        cmd_forecast(args[1:])
+    elif cmd == "bridge":
+        cmd_bridge(args[1:])
+    elif cmd == "import":
+        path = args[1] if len(args) > 1 else None
+        cmd_import(path)
+    else:
+        print(f"Unknown command: {cmd}")
+        print(__doc__)
+
+
+if __name__ == "__main__":
+    main()

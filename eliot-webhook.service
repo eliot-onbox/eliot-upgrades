@@ -1,0 +1,20 @@
+[Unit]
+Description=Eliot Webhook Server
+After=network.target
+Documentation=https://github.com/tudor/eliot-upgrades
+
+[Service]
+Type=simple
+
+WorkingDirectory=/home/eliot/projects/eliot-upgrades
+ExecStart=/usr/bin/python3 /home/eliot/projects/eliot-upgrades/webhook_server.py
+Restart=always
+RestartSec=5
+Environment=ELIOT_DB=/home/eliot/workspace/data/eliot.db
+Environment=ELIOT_WEBHOOK_PORT=18790
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=eliot-webhook
+
+[Install]
+WantedBy=default.target
