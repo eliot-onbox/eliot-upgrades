@@ -18,6 +18,16 @@ from db import get_conn, init_db
 
 STATE_FILE = os.path.expanduser("~/.openclaw/workspace/memory/heartbeat-state.json")
 TASKQUEUE = os.path.expanduser("~/.openclaw/workspace/TASKQUEUE.md")
+PREFERENCES_FILE = os.path.expanduser("~/.openclaw/workspace/memory/preferences.json")
+
+# Preference vetoes: action name -> reason why it's blocked
+# Loaded from preferences.json, editable by the agent
+def load_preferences() -> dict:
+    """Load action vetoes/preferences. Format: {"vetoes": {"action_name": "reason"}}"""
+    if os.path.exists(PREFERENCES_FILE):
+        with open(PREFERENCES_FILE) as f:
+            return json.load(f)
+    return {"vetoes": {}}
 
 
 def load_state() -> dict:
@@ -140,6 +150,11 @@ def score_actions(state: dict, usage_level: str) -> list[dict]:
             "reason": f"No digest in {h:.0f}h",
             "instruction": "Run eliot-ctx digest to capture today's activity.",
         })
+
+    # --- Filter by preferences/vetoes ---
+    prefs = load_preferences()
+    vetoes = prefs.get("vetoes", {})
+    actions = [a for a in actions if a["action"] not in vetoes]
 
     # --- Scale by usage ---
     if usage_level == "CRITICAL":
