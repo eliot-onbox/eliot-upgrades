@@ -53,6 +53,7 @@ TOKEN = None  # loaded at startup
 
 class WebhookServer(HTTPServer):
     allow_reuse_address = True
+    allow_reuse_port = True
 
 
 class WebhookHandler(BaseHTTPRequestHandler):
