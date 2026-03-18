@@ -721,9 +721,23 @@ def decide(usage_level: str = "NORMAL") -> list[dict]:
         return []
 
     world = build_world()
+
+    # Load preference vetoes
+    prefs_file = os.path.expanduser("~/.openclaw/workspace/memory/preferences.json")
+    vetoes = {}
+    if os.path.exists(prefs_file):
+        try:
+            with open(prefs_file) as f:
+                vetoes = json.load(f).get("vetoes", {})
+        except (json.JSONDecodeError, OSError):
+            pass
+
     candidates = []
 
     for init in INITIATIVES:
+        # Skip vetoed actions
+        if init["id"] in vetoes:
+            continue
         result = evaluate(init, world)
         if result and result["priority"] >= min_pri:
             candidates.append(result)
