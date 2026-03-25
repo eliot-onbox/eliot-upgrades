@@ -34,7 +34,7 @@ from db import get_conn, init_db, DB_PATH
 # ---------------------------------------------------------------------------
 
 TUDOR_STATE = os.environ.get(
-    "TUDOR_STATE_FILE", "/home/eliot/workspace/data/tudor-state.json"
+    "TUDOR_STATE_FILE", "/home/eliot/.openclaw/workspace/data/tudor-state.json"
 )
 HEARTBEAT_STATE = os.path.expanduser(
     "~/.openclaw/workspace/memory/heartbeat-state.json"

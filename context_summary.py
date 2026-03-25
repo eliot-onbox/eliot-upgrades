@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from db import get_conn, DB_PATH
 
-STATE_FILE = "/home/eliot/workspace/data/tudor-state.json"
+STATE_FILE = "/home/eliot/.openclaw/workspace/data/tudor-state.json"
 
 
 def get_state():

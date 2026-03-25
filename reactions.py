@@ -5,7 +5,7 @@ import os
 from datetime import datetime
 
 STATE_FILE = os.environ.get(
-    "TUDOR_STATE_FILE", "/home/eliot/workspace/data/tudor-state.json"
+    "TUDOR_STATE_FILE", "/home/eliot/.openclaw/workspace/data/tudor-state.json"
 )
 
 

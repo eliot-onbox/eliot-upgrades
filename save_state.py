@@ -15,7 +15,7 @@ import sys
 from datetime import datetime
 
 CONTINUATION_FILE = os.path.expanduser("~/workspace/CONTINUATION.md")
-STATE_FILE = "/home/eliot/workspace/data/tudor-state.json"
+STATE_FILE = "/home/eliot/.openclaw/workspace/data/tudor-state.json"
 TASKQUEUE_FILE = os.path.expanduser("~/workspace/TASKQUEUE.md")
 
 

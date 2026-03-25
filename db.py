@@ -3,7 +3,7 @@
 import sqlite3
 import os
 
-DB_PATH = os.environ.get("ELIOT_DB", "/home/eliot/workspace/data/eliot.db")
+DB_PATH = os.environ.get("ELIOT_DB", "/home/eliot/.openclaw/workspace/data/eliot.db")
 
 
 def get_conn():

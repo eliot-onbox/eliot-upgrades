@@ -34,7 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from db import get_conn, init_db, DB_PATH
 from categories import CATEGORY_LABELS
 
-STATE_FILE = "/home/eliot/workspace/data/tudor-state.json"
+STATE_FILE = "/home/eliot/.openclaw/workspace/data/tudor-state.json"
 MEMORY_DIR = os.path.expanduser("~/.openclaw/workspace/memory")
 TASKQUEUE_PATH = os.path.expanduser("~/.openclaw/workspace/TASKQUEUE.md")
 PROJECTS_DIR = os.path.expanduser("~/projects")
