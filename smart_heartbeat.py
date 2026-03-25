@@ -374,8 +374,8 @@ INITIATIVES = [
         "id": "email_triage",
         "category": "productivity",
         "base_priority": 0.55,
-        "cooldown_hours": 2,
-        "max_daily": 6,
+        "cooldown_hours": 4,
+        "max_daily": 4,
         "instruction": (
             "Run: himalaya envelope list --page-size 10. "
             "Read anything that looks important. Ignore newsletters and noise. "
@@ -399,8 +399,8 @@ INITIATIVES = [
         "id": "taskqueue_work",
         "category": "productivity",
         "base_priority": 0.45,
-        "cooldown_hours": 2,
-        "max_daily": 4,
+        "cooldown_hours": 4,
+        "max_daily": 3,
         "instruction": (
             "Pick the highest-value task from TASKQUEUE.md and work on it. "
             "Mark it done when finished. "
